@@ -1,9 +1,10 @@
 """
 Color quantization in OKLab space.
 
-Why OKLab: RGB distance lies about perceived color similarity. OKLab is a modern
-perceptually-uniform space (Ottosson 2020). Clustering here produces palettes
-that look right to human eyes, not to pixel math.
+Alpha-aware version:
+- Transparent pixels are ignored during k-means.
+- Transparent pixels stay transparent in the returned image.
+- Speck cleanup ignores transparent pixels so they do not turn into black regions.
 """
 from __future__ import annotations
 
@@ -17,12 +18,20 @@ from sklearn.cluster import KMeans
 
 def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
     """sRGB in [0,1] -> linear RGB."""
-    return np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    return np.where(
+        rgb <= 0.04045,
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055) ** 2.4,
+    )
 
 
 def _linear_to_srgb(rgb: np.ndarray) -> np.ndarray:
     """Linear RGB -> sRGB in [0,1]."""
-    return np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * (rgb ** (1 / 2.4)) - 0.055)
+    return np.where(
+        rgb <= 0.0031308,
+        rgb * 12.92,
+        1.055 * (rgb ** (1 / 2.4)) - 0.055,
+    )
 
 
 _M1 = np.array([
@@ -67,55 +76,65 @@ def quantize(
     sample_size: int = 20000,
     merge_threshold: float = 0.0,
     seed: int = 0,
+    alpha_threshold: int = 8,
 ) -> tuple[Image.Image, np.ndarray]:
     """
     Reduce an image to k perceptually-distinct colors.
 
     Args:
-        image: PIL Image (any mode; will be converted to RGB).
-        k: target color count (2-32 reasonable).
-        sample_size: pixels to sample for k-means fit (speed). Full image is
-            then mapped to the fitted palette.
-        merge_threshold: if > 0, merge clusters whose OKLab distance (ΔE_OK)
-            is below this value. A good range is 0.01-0.05. Set 0 to disable.
+        image: PIL Image. RGBA transparency is preserved.
+        k: target visible color count.
+        sample_size: pixels to sample for k-means fit.
+        merge_threshold: if > 0, merge clusters whose OKLab distance is below this value.
         seed: RNG seed for reproducibility.
+        alpha_threshold: alpha below this value is treated as transparent.
 
     Returns:
-        (quantized PIL Image in RGB mode, palette as (n, 3) uint8 RGB array)
+        (quantized PIL Image in RGBA mode, palette as (n, 3) uint8 RGB array)
     """
-    rgb_img = image.convert("RGB")
-    arr = np.asarray(rgb_img)
-    h, w = arr.shape[:2]
-    pixels = arr.reshape(-1, 3)
+    rgba_img = image.convert("RGBA")
+    arr_rgba = np.asarray(rgba_img)
+    h, w = arr_rgba.shape[:2]
 
-    # Sample for k-means fit (full clustering on multi-MP images is slow and
-    # unnecessary — a representative sample finds the same centers).
+    rgb = arr_rgba[..., :3]
+    alpha = arr_rgba[..., 3]
+    opaque_mask = alpha >= alpha_threshold
+
+    if not opaque_mask.any():
+        empty = np.zeros((h, w, 4), dtype=np.uint8)
+        return Image.fromarray(empty, mode="RGBA"), np.empty((0, 3), dtype=np.uint8)
+
+    opaque_pixels = rgb[opaque_mask].reshape(-1, 3)
+    actual_k = max(1, min(k, len(np.unique(opaque_pixels, axis=0))))
+
     rng = np.random.default_rng(seed)
-    if len(pixels) > sample_size:
-        idx = rng.choice(len(pixels), size=sample_size, replace=False)
-        sample = pixels[idx]
+    if len(opaque_pixels) > sample_size:
+        idx = rng.choice(len(opaque_pixels), size=sample_size, replace=False)
+        sample = opaque_pixels[idx]
     else:
-        sample = pixels
+        sample = opaque_pixels
 
     sample_lab = rgb_to_oklab(sample)
 
-    km = KMeans(n_clusters=k, n_init=4, random_state=seed)
+    km = KMeans(n_clusters=actual_k, n_init=4, random_state=seed)
     km.fit(sample_lab)
     centers_lab = km.cluster_centers_
 
-    # Optional: merge near-duplicate centers (perceptually identical).
     if merge_threshold > 0:
         centers_lab = _merge_close(centers_lab, merge_threshold)
 
-    # Map every full-res pixel to nearest center (in OKLab).
-    all_lab = rgb_to_oklab(pixels)
-    # Squared distance is fine for nearest-neighbor.
+    all_lab = rgb_to_oklab(opaque_pixels)
     d2 = ((all_lab[:, None, :] - centers_lab[None, :, :]) ** 2).sum(-1)
     labels = d2.argmin(axis=1)
 
     palette_rgb = oklab_to_rgb(centers_lab)
-    out = palette_rgb[labels].reshape(h, w, 3)
-    return Image.fromarray(out, mode="RGB"), palette_rgb
+
+    out_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    out_rgba[..., 3] = 0
+    out_rgba[opaque_mask, :3] = palette_rgb[labels]
+    out_rgba[opaque_mask, 3] = 255
+
+    return Image.fromarray(out_rgba, mode="RGBA"), palette_rgb
 
 
 def _merge_close(centers_lab: np.ndarray, threshold: float) -> np.ndarray:
@@ -129,7 +148,7 @@ def _merge_close(centers_lab: np.ndarray, threshold: float) -> np.ndarray:
                 d = np.linalg.norm(centers[i] - centers[j])
                 if d < threshold:
                     merged = (centers[i] + centers[j]) / 2
-                    centers = [c for k, c in enumerate(centers) if k not in (i, j)]
+                    centers = [c for idx, c in enumerate(centers) if idx not in (i, j)]
                     centers.append(merged)
                     changed = True
                     break
@@ -142,51 +161,59 @@ def cleanup_specks(
     image: Image.Image,
     min_region_px: int = 8,
     progress: "callable | None" = None,
+    alpha_threshold: int = 8,
 ) -> Image.Image:
     """
-    Replace tiny color regions with their dominant neighbor's color.
+    Replace tiny opaque color regions with their dominant opaque neighbor color.
 
-    Print-on-demand benefits from this even though it isn't strictly required:
-    fewer micro-paths in the trace = smaller, cleaner SVG and crisper print.
-
-    Performance: uses ndimage.find_objects to operate within each region's
-    bounding box rather than scanning the whole image per region. On a 4 MP
-    photo with thousands of small regions, this is 10000x+ faster than the
-    naive approach.
+    Transparent pixels stay transparent and are ignored during cleanup.
     """
-    from scipy import ndimage  # local import; only used here
+    from scipy import ndimage
+
     say = progress or (lambda _m: None)
 
-    arr = np.asarray(image.convert("RGB"))
+    rgba_img = image.convert("RGBA")
+    arr = np.asarray(rgba_img).copy()
     h, w = arr.shape[:2]
 
-    # Encode each (r,g,b) as a single int for fast labeling.
-    encoded = (arr[..., 0].astype(np.int64) << 16
-               | arr[..., 1].astype(np.int64) << 8
-               | arr[..., 2].astype(np.int64))
+    rgb = arr[..., :3]
+    alpha = arr[..., 3]
+    opaque_mask = alpha >= alpha_threshold
+
+    if not opaque_mask.any():
+        return rgba_img
+
+    encoded = (
+        (rgb[..., 0].astype(np.int64) << 16)
+        | (rgb[..., 1].astype(np.int64) << 8)
+        | rgb[..., 2].astype(np.int64)
+    )
+
+    transparent_sentinel = -1
+    encoded[~opaque_mask] = transparent_sentinel
 
     total_replaced = 0
-    unique_colors = np.unique(encoded)
-    say(f"  scanning {len(unique_colors)} color regions…")
+    unique_colors = np.unique(encoded[opaque_mask])
+    say(f"  scanning {len(unique_colors)} opaque color regions…")
 
     for ci, color in enumerate(unique_colors):
         mask = encoded == color
         labeled, n_regions = ndimage.label(mask)
         if n_regions == 0:
             continue
+
         sizes = ndimage.sum(mask, labeled, range(1, n_regions + 1))
         small_ids = np.where(sizes < min_region_px)[0] + 1
         if len(small_ids) == 0:
             continue
 
-        # Bounding boxes for each region — keyed by region_id - 1.
         objects = ndimage.find_objects(labeled)
 
         for rid in small_ids:
             bbox = objects[rid - 1]
             if bbox is None:
                 continue
-            # Pad bbox by 1 px to capture border pixels via dilation.
+
             y0 = max(0, bbox[0].start - 1)
             y1 = min(h, bbox[0].stop + 1)
             x0 = max(0, bbox[1].start - 1)
@@ -197,26 +224,32 @@ def cleanup_specks(
             local_mask = local_labeled == rid
 
             dilated = ndimage.binary_dilation(local_mask) & ~local_mask
-            if not dilated.any():
+            neighbor_mask = dilated & (local_encoded != transparent_sentinel)
+            if not neighbor_mask.any():
                 continue
 
-            border_colors = local_encoded[dilated]
+            border_colors = local_encoded[neighbor_mask]
             vals, counts = np.unique(border_colors, return_counts=True)
             replacement = vals[counts.argmax()]
 
-            # Write back in-place to the global array's bbox slice.
             local_encoded_view = encoded[y0:y1, x0:x1]
             local_encoded_view[local_mask] = replacement
             total_replaced += 1
 
         say(f"  color {ci + 1}/{len(unique_colors)}: cleaned {len(small_ids)} regions")
 
-    # Decode back to RGB
-    output = np.stack([
+    output_rgb = np.stack([
         ((encoded >> 16) & 0xFF).astype(np.uint8),
         ((encoded >> 8) & 0xFF).astype(np.uint8),
         (encoded & 0xFF).astype(np.uint8),
     ], axis=-1)
-    say(f"  total: replaced {total_replaced} speck regions")
 
-    return Image.fromarray(output, mode="RGB")
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    out[..., :3] = output_rgb
+    out[..., 3] = 0
+    out[opaque_mask, 3] = 255
+    out[~opaque_mask, :3] = 0
+    out[~opaque_mask, 3] = 0
+
+    say(f"  total: replaced {total_replaced} speck regions")
+    return Image.fromarray(out, mode="RGBA")
