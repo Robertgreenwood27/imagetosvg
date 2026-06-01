@@ -1,0 +1,9 @@
+vtracer>=0.6
+svgpathtools>=1.6
+scikit-learn>=1.0
+pillow>=9.0
+numpy>=1.20
+scipy>=1.7
+PyQt6>=6.5
+# Optional, for rasterizing SVG previews:
+# cairosvg>=2.5

@@ -1,0 +1,78 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Pipeline outputs ---
+# Generated SVGs, quantized previews, etc. Keep the engine source, not its output.
+out/
+output/
+outputs/
+*.svg
+*.svg.bak
+
+# But DO track example/reference SVGs if you ever add them in docs/
+!docs/**/*.svg
+!examples/**/*.svg
+
+# --- Test images / scratch work ---
+test_*.png
+test_*.jpg
+test_*.jpeg
+test_*.webp
+comparison*.png
+ui_screenshot*.png
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Jupyter / notebooks ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --- Type checkers / linters / coverage ---
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- PyInstaller (if you ever ship a desktop binary) ---
+*.spec
+*.manifest
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Local secrets / config ---
+# If you ever wire in the Anthropic API for the judge step:
+.env
+.env.local
+config.local.json
+*.key
