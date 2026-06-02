@@ -1,5 +1,6 @@
 """
-Top-level pipeline: photo -> quantized image -> SVG -> N smoothing passes.
+Top-level pipeline: photo -> quantized image -> SVG -> N smoothing passes
+-> primitive dispatch simplification.
 
 This is the engine API. Callers (CLI today, GUI tomorrow, web later) use only
 this and don't reach into the submodules unless they have to.
@@ -16,6 +17,7 @@ from PIL import Image
 from .quantize import quantize, cleanup_specks
 from .trace import trace, TraceConfig
 from .smooth import smooth_pass, SmoothConfig
+from .simplify import simplify_pass, SimplifyConfig
 
 
 @dataclass
@@ -26,7 +28,9 @@ class PipelineConfig:
     max_dim_px: int = 0                    # 0 = no downscaling; else max(w,h) cap
     trace: TraceConfig = field(default_factory=TraceConfig)
     smooth: SmoothConfig = field(default_factory=SmoothConfig)
+    simplify: SimplifyConfig = field(default_factory=SimplifyConfig)
     smoothing_passes: int = 3
+    run_simplify: bool = True              # False to skip primitive dispatch
 
 
 @dataclass
@@ -35,6 +39,7 @@ class PipelineResult:
     palette_rgb: list
     raw_svg: str
     smoothed_svgs: list[str]
+    final_svg: str          # smoothed_svgs[-1] after simplify (or without if disabled)
     timings: dict
 
 
@@ -45,20 +50,15 @@ def run(
 ) -> PipelineResult:
     """
     Run the full pipeline. `progress` is an optional callback for status text.
-    Each stage prints "Stage..." then "  done in Xs" so the caller sees forward
-    motion even on long-running stages.
     """
     cfg = config or PipelineConfig()
     say = progress or (lambda _msg: None)
     timings: dict[str, float] = {}
 
-    # Image info upfront so the user knows what we're working with.
     w, h = image.size
     mp = (w * h) / 1_000_000
     say(f"Input: {w}x{h} pixels ({mp:.1f} MP, mode={image.mode})")
 
-    # Optional downscale. Huge photos make every stage slow without giving
-    # better SVG output because the trace can't represent that detail anyway.
     if cfg.max_dim_px > 0 and max(w, h) > cfg.max_dim_px:
         scale = cfg.max_dim_px / max(w, h)
         new_size = (int(w * scale), int(h * scale))
@@ -107,11 +107,26 @@ def run(
         say(f"  done in {dt:.2f}s ({len(current) // 1024} KB)")
         smoothed.append(current)
 
+    # Primitive dispatch simplification (run once, after all smoothing)
+    final_svg = current
+    if cfg.run_simplify and smoothed:
+        t0 = time.perf_counter()
+        say("Running primitive dispatch simplification...")
+        final_svg = simplify_pass(current, cfg.simplify)
+        timings["simplify"] = time.perf_counter() - t0
+        saving_pct = 100 * (1 - len(final_svg) / max(1, len(current)))
+        say(
+            f"  done in {timings['simplify']:.2f}s  "
+            f"({len(current) // 1024} KB -> {len(final_svg) // 1024} KB, "
+            f"{saving_pct:.1f}% reduction)"
+        )
+
     return PipelineResult(
         quantized=quantized,
         palette_rgb=[tuple(int(c) for c in row) for row in palette],
         raw_svg=raw_svg,
         smoothed_svgs=smoothed,
+        final_svg=final_svg,
         timings=timings,
     )
 
