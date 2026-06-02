@@ -10,6 +10,7 @@ What this version improves:
 - Visible busy/progress state while quantizing/tracing/smoothing.
 - Presets for common output goals.
 - Same engine calls as before: quantize -> cleanup_specks -> trace -> smooth_pass.
+- Optional border-connected white background removal (before quantize).
 
 Run with:    python -m ui.desktop
 Or:          python ui/desktop.py
@@ -57,6 +58,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QProgressBar,
     QComboBox,
+    QCheckBox,
 )
 
 # Make the engine importable whether we run as module or as script.
@@ -66,6 +68,7 @@ sys.path.insert(0, str(_HERE.parent))
 from engine.quantize import quantize, cleanup_specks       # noqa: E402
 from engine.trace import trace, TraceConfig                # noqa: E402
 from engine.smooth import smooth_pass, SmoothConfig        # noqa: E402
+from engine.bg_remove import remove_white_background, BgRemoveConfig  # noqa: E402
 
 
 APP_QSS = """
@@ -186,6 +189,38 @@ QStatusBar {
     background: #080b10;
     color: #96a4b7;
 }
+
+QCheckBox {
+    color: #d6dde8;
+    spacing: 8px;
+}
+
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border: 2px solid #344357;
+    border-radius: 5px;
+    background: #0d131b;
+}
+
+QCheckBox::indicator:checked {
+    background: #13a86b;
+    border-color: #1fd98c;
+    image: none;
+}
+
+QCheckBox::indicator:checked:hover {
+    background: #19bf7c;
+}
+
+QCheckBox:disabled {
+    color: #697584;
+}
+
+QCheckBox::indicator:disabled {
+    border-color: #202a38;
+    background: #131922;
+}
 """
 
 
@@ -235,6 +270,16 @@ def describe_passes(n: int) -> str:
     if n <= 5:
         return "Balanced smoothing. Good default for clean merch-style SVGs."
     return "Heavy smoothing. Softer shapes, but small details can melt together."
+
+
+def describe_bg_tolerance(v: int) -> str:
+    if v <= 10:
+        return "Strict: removes only near-pure white. Safe for images with light colors."
+    if v <= 30:
+        return "Balanced: removes white and slightly off-white backgrounds."
+    if v <= 60:
+        return "Loose: also catches cream, beige, or yellowish paper backgrounds."
+    return "Aggressive: removes very light backgrounds; may eat into pale subject areas."
 
 
 # ----------------------------------------------------------------------------
@@ -384,7 +429,6 @@ class SvgPane(QWidget):
 class LabeledSlider(QWidget):
     """
     Slider with a name, value badge, and live helper text.
-    This makes the controls feel like art-direction choices instead of mystery knobs.
     """
 
     valueChanged = pyqtSignal(int)
@@ -502,7 +546,7 @@ class TraceWorker(QThread):
 
 
 class QuantizeWorker(QThread):
-    """Runs quantize on the full-resolution image, with optional speck cleanup."""
+    """Runs (optional bg removal +) quantize on the full-resolution image."""
 
     progress = pyqtSignal(str)
     finished_ok = pyqtSignal(object)  # PIL Image
@@ -514,18 +558,28 @@ class QuantizeWorker(QThread):
         k: int,
         merge_threshold: float,
         speck_min_px: int,
+        remove_bg: bool,
+        bg_cfg: BgRemoveConfig,
     ):
         super().__init__()
         self.image = image
         self.k = k
         self.merge_threshold = merge_threshold
         self.speck_min_px = speck_min_px
+        self.remove_bg = remove_bg
+        self.bg_cfg = bg_cfg
 
     def run(self):
         try:
+            image = self.image
+
+            if self.remove_bg:
+                self.progress.emit("Removing border-connected white background…")
+                image = remove_white_background(image, self.bg_cfg)
+
             self.progress.emit("Reducing image to selected color palette…")
             quantized, _palette = quantize(
-                self.image,
+                image,
                 k=self.k,
                 merge_threshold=self.merge_threshold,
             )
@@ -580,7 +634,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Photo → SVG Lab")
-        self.resize(1380, 880)
+        self.resize(1380, 920)
 
         self.full_image: Image.Image | None = None
         self.preview_source: Image.Image | None = None
@@ -751,6 +805,42 @@ class MainWindow(QMainWindow):
 
         controls_col.addWidget(sliders_box)
 
+        # ---- Background Removal box ------------------------------------
+        bg_box = QGroupBox("Background Removal")
+        bg_layout = QVBoxLayout(bg_box)
+        bg_layout.setSpacing(8)
+
+        self.bg_check = QCheckBox("Remove white/near-white background")
+        self.bg_check.setToolTip(
+            "Flood-fills from border edges and removes pixels that are white or near-white.\n"
+            "Runs before quantization so the background color never enters the palette.\n"
+            "Best for product photos, scans, and clip-art on white paper."
+        )
+        self.bg_check.stateChanged.connect(self._on_bg_toggle)
+        bg_layout.addWidget(self.bg_check)
+
+        self.bg_hint = QLabel(
+            "Off — background will be included in the color palette."
+        )
+        self.bg_hint.setWordWrap(True)
+        self.bg_hint.setStyleSheet("color: #8f9bae; font-size: 12px;")
+        bg_layout.addWidget(self.bg_hint)
+
+        self.bg_tolerance_control = LabeledSlider(
+            "Sensitivity",
+            5,
+            80,
+            30,
+            5,
+            describe_bg_tolerance,
+            "",
+        )
+        self.bg_tolerance_control.setEnabled(False)
+        self.bg_tolerance_control.valueChanged.connect(self._schedule_preview)
+        bg_layout.addWidget(self.bg_tolerance_control)
+
+        controls_col.addWidget(bg_box)
+
         advanced_box = QGroupBox("Advanced")
         advanced = QGridLayout(advanced_box)
 
@@ -879,6 +969,28 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved {path}", 4000)
         self._set_activity("Saved SVG", indeterminate=False)
 
+    # -- Background removal toggle ------------------------------------------
+
+    def _on_bg_toggle(self, state: int):
+        enabled = bool(state)
+        self.bg_tolerance_control.setEnabled(enabled)
+        if enabled:
+            self.bg_hint.setText(
+                "On — border-connected white pixels will be made transparent before tracing."
+            )
+        else:
+            self.bg_hint.setText(
+                "Off — background will be included in the color palette."
+            )
+        self._schedule_preview()
+
+    def _bg_config(self) -> BgRemoveConfig:
+        return BgRemoveConfig(
+            luma_threshold=255 - self.bg_tolerance_control.value(),
+            channel_tolerance=self.bg_tolerance_control.value(),
+            feather_px=1,
+        )
+
     # -- Presets / controls -------------------------------------------------
 
     def _apply_preset(self, name: str):
@@ -887,9 +999,6 @@ class MainWindow(QMainWindow):
             return
 
         self.preset_hint.setText(preset["hint"])
-
-        # Blocking is not necessary here. A couple preview schedules are harmless,
-        # and the debounce collapses them into one preview update.
         self.k_control.setValue(preset["k"])
         self.speck_control.setValue(preset["speck"])
         self.maxdim_control.setValue(preset["maxdim"])
@@ -906,15 +1015,21 @@ class MainWindow(QMainWindow):
         self._preview_debounce.start()
 
     def _update_preview_quantize(self):
-        """Quantize the downscaled preview source. Fast even on large photos."""
+        """Quantize (and optionally bg-remove) the downscaled preview source."""
         if self.preview_source is None:
             return
 
         k = self.k_control.value()
         speck = self.speck_control.value()
+        remove_bg = self.bg_check.isChecked()
 
         try:
-            quantized, _ = quantize(self.preview_source, k=k, merge_threshold=0.02)
+            source = self.preview_source
+
+            if remove_bg:
+                source = remove_white_background(source, self._bg_config())
+
+            quantized, _ = quantize(source, k=k, merge_threshold=0.02)
 
             if speck > 0 and self.full_image is not None:
                 scale = (
@@ -926,8 +1041,9 @@ class MainWindow(QMainWindow):
             self.preview_quantized = quantized
             self.quant_pane.set_pixmap(pil_to_qpixmap(quantized))
             self._set_activity("Preview updated", indeterminate=False)
+            bg_note = " (bg removed)" if remove_bg else ""
             self.statusBar().showMessage(
-                f"Preview updated: {k} colors, cleanup {speck}px."
+                f"Preview updated: {k} colors, cleanup {speck}px{bg_note}."
             )
         except Exception as e:
             self._set_activity("Preview failed", indeterminate=False)
@@ -951,6 +1067,8 @@ class MainWindow(QMainWindow):
             k=self.k_control.value(),
             merge_threshold=0.02,
             speck_min_px=self.speck_control.value(),
+            remove_bg=self.bg_check.isChecked(),
+            bg_cfg=self._bg_config(),
         )
         self._quantize_worker.progress.connect(
             lambda msg: (self.statusBar().showMessage(msg), self._set_activity(msg, True))
@@ -1130,9 +1248,16 @@ class MainWindow(QMainWindow):
             self.open_btn,
             self.reset_btn,
             self.preset_combo,
+            self.bg_check,
         )
         for widget in widgets:
             widget.setEnabled(not busy)
+
+        # Keep the tolerance slider in sync with the checkbox state when not busy
+        if not busy:
+            self.bg_tolerance_control.setEnabled(self.bg_check.isChecked())
+        else:
+            self.bg_tolerance_control.setEnabled(False)
 
         if not busy:
             self._refresh_action_states()

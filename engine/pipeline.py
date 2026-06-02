@@ -1,6 +1,6 @@
 """
-Top-level pipeline: photo -> quantized image -> SVG -> N smoothing passes
--> primitive dispatch simplification.
+Top-level pipeline: photo -> (optional bg removal) -> quantized image
+-> SVG -> N smoothing passes -> primitive dispatch simplification.
 
 This is the engine API. Callers (CLI today, GUI tomorrow, web later) use only
 this and don't reach into the submodules unless they have to.
@@ -18,6 +18,7 @@ from .quantize import quantize, cleanup_specks
 from .trace import trace, TraceConfig
 from .smooth import smooth_pass, SmoothConfig
 from .simplify import simplify_pass, SimplifyConfig
+from .bg_remove import remove_white_background, BgRemoveConfig
 
 
 @dataclass
@@ -31,6 +32,10 @@ class PipelineConfig:
     simplify: SimplifyConfig = field(default_factory=SimplifyConfig)
     smoothing_passes: int = 3
     run_simplify: bool = True              # False to skip primitive dispatch
+
+    # Background removal (opt-in, runs before quantize)
+    remove_bg: bool = False
+    bg_remove: BgRemoveConfig = field(default_factory=BgRemoveConfig)
 
 
 @dataclass
@@ -64,6 +69,14 @@ def run(
         new_size = (int(w * scale), int(h * scale))
         say(f"Downscaling to {new_size[0]}x{new_size[1]} (max_dim={cfg.max_dim_px})")
         image = image.resize(new_size, Image.LANCZOS)
+
+    # Background removal (before quantize so the bg color never enters the palette)
+    if cfg.remove_bg:
+        t0 = time.perf_counter()
+        say("Removing border-connected white background…")
+        image = remove_white_background(image, cfg.bg_remove)
+        timings["bg_remove"] = time.perf_counter() - t0
+        say(f"  done in {timings['bg_remove']:.2f}s")
 
     # Quantize
     t0 = time.perf_counter()

@@ -18,6 +18,7 @@ from engine.pipeline import run_from_file, PipelineConfig
 from engine.trace import TraceConfig
 from engine.smooth import SmoothConfig
 from engine.simplify import SimplifyConfig
+from engine.bg_remove import BgRemoveConfig
 
 
 def main() -> int:
@@ -39,6 +40,19 @@ def main() -> int:
                     help="Corner angle threshold (degrees)")
     ap.add_argument("--fit-error", type=float, default=0.8,
                     help="Max Bezier fit error before subdivision (px)")
+
+    # Background removal flags
+    ap.add_argument("--remove-bg", action="store_true",
+                    help="Remove border-connected white/near-white background before quantize")
+    ap.add_argument("--bg-luma", type=int, default=230,
+                    help="Luma threshold for background detection (0-255, default 230). "
+                         "Higher = only pure white; lower = also removes cream/beige.")
+    ap.add_argument("--bg-tolerance", type=int, default=30,
+                    help="Per-channel distance from 255 for a pixel to be considered "
+                         "white-ish (default 30). Lower = stricter white-only removal.")
+    ap.add_argument("--bg-feather", type=int, default=1,
+                    help="Edge feather/erosion radius in pixels (0 to disable, default 1). "
+                         "Removes the residual white halo at the mask boundary.")
 
     # Simplify flags
     ap.add_argument("--no-simplify", action="store_true",
@@ -66,6 +80,12 @@ def main() -> int:
         max_dim_px=args.max_dim,
         smoothing_passes=args.passes,
         run_simplify=not args.no_simplify,
+        remove_bg=args.remove_bg,
+        bg_remove=BgRemoveConfig(
+            luma_threshold=args.bg_luma,
+            channel_tolerance=args.bg_tolerance,
+            feather_px=args.bg_feather,
+        ),
         trace=TraceConfig(),
         smooth=SmoothConfig(
             rdp_tolerance_px=args.rdp,
